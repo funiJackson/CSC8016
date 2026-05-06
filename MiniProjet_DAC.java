@@ -5,15 +5,18 @@ import java.awt.event.ActionListener;
 import static java.lang.Thread.sleep;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.lang.reflect.InvocationTargetException;
 import javax.swing.JButton;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSlider;
+import javax.swing.SwingUtilities;
 import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
 import static mini.projet_dac.carrefourManager.*; 
@@ -40,8 +43,6 @@ public class MiniProjet_DAC extends JFrame {
     private JSlider trafficGrowthSlider;
     private JSlider lightDurationSlider;
     private JSlider carCountSlider;
-    private imgVoitureVoie1 C1;
-    private imgVoitureVoie2 C2;
     static JLabel feuVoie1Green;
     static JLabel feuVoie1Orange;
     static JLabel feuVoie1Red;
@@ -51,16 +52,40 @@ public class MiniProjet_DAC extends JFrame {
     static JLabel feuVoie2Red;
     private JPanel feuVoie2Panel;
     private backgroundPanel crossroadPanel;
-    // atomic varibales are used to avoid concurrency on the use of the same variable by multiple threads ---> this can be replaced by semaphore mutex
+    // [Concurrency Tech: Atomic variables for cross-thread state]
+    // WHY atomics (not plain int/boolean): every field below is read and
+    // written from at least two threads -- the EDT (slider/button
+    // handlers), the producer thread (createCars), the lightManager
+    // thread, and N car worker threads. Using AtomicInteger /
+    // AtomicBoolean gives us cheap, lock-free, memory-visible publication
+    // for these shared scalars; the heavier verro lock is reserved for
+    // the multi-field state that must change together (light booleans,
+    // intersection counter, queue positions).
     static AtomicInteger duree_de_feu = new AtomicInteger(10000);     //duree between (5000-->5s , 20000-->20s)
-    int speed = 4;   //speed between (1-8)
-    int circulationGrow = (new Random().nextInt(8) + 1) * 1000;       // traffic between (1000-->1s, 8000-->8s)
-    int carsPerWave = 3;  //number of cars created in each direction every traffic interval
+    // [CONCURRENCY FIX - P2 visibility]
+    // speed / circulationGrow / carsPerWave are written on the EDT and
+    // read by the producer thread. Plain int reads on a worker thread
+    // are NOT guaranteed to observe the EDT's writes by the JMM. Marking
+    // them volatile establishes a happens-before edge on every read so
+    // the producer always sees the latest slider value.
+    volatile int speed = 4;   //speed between (1-8)
+    volatile int circulationGrow = (new Random().nextInt(8) + 1) * 1000;       // traffic between (1000-->1s, 8000-->8s)
+    volatile int carsPerWave = 3;  //number of cars created in each direction every traffic interval
     static AtomicInteger seconds = new AtomicInteger(duree_de_feu.get() / 1000);//seconds for the timer counter
-    AtomicBoolean settingChanged = new AtomicBoolean(false);      //this is used when you change the settings (speed or light duration) 
-    static AtomicInteger carNumberInTheStreet = new AtomicInteger(0);   //counter for the cars in the street (v1 or v2)
-    static CountDownLatch carCounterInTheStreet;         //coutdownlatch to wait for the cars in the street
-    static AtomicBoolean stopButtonIsActive = new AtomicBoolean(true);    //this is used when you press the stop button
+    AtomicBoolean settingChanged = new AtomicBoolean(false);      //slider listeners flip this so the producer knows to wait on the latch
+    static AtomicInteger carNumberInTheStreet = new AtomicInteger(0);   //counter incremented/decremented by car threads, read by lightManager + slider listeners
+    // [Concurrency Tech: CountDownLatch settings handoff]
+    // Allocated by a slider listener with carNumberInTheStreet as count;
+    // each car counts down on exit; producer awaits zero before applying
+    // the new setting.
+    // [CONCURRENCY FIX - P2 visibility]
+    // `volatile` is required: the EDT slider listeners reassign the
+    // reference (lines below). Without volatile, the producer thread
+    // and car threads have NO happens-before guarantee that they see
+    // the new latch reference -- they could observe null or a stale
+    // already-counted-down latch and either NPE or skip the handshake.
+    static volatile CountDownLatch carCounterInTheStreet;
+    static AtomicBoolean stopButtonIsActive = new AtomicBoolean(true);    //flipped by STOP/START buttons on EDT, polled by all worker threads
     
      //</editor-fold>
     
@@ -101,7 +126,9 @@ public class MiniProjet_DAC extends JFrame {
         feuVoie2Red.setBackground(new java.awt.Color(255, 255, 255));
         feuVoie2Red.setBounds(0, 0, 35, 30);
         feuVoie2Red.setIcon(new javax.swing.ImageIcon("lights/1.png"));
-        feuVoie2Red.setEnabled(false);
+        // [CONCURRENCY FIX - P2: initial light state matches monitor]
+        // feuVert2 starts FALSE, so voie2 must start visually RED.
+        feuVoie2Red.setEnabled(true);
         feuVoie2Panel.add(feuVoie2Red);
         feuVoie2Orange.setBounds(35, 0, 35, 30);
         feuVoie2Orange.setIcon(new javax.swing.ImageIcon("lights/3.jpg"));
@@ -127,7 +154,13 @@ public class MiniProjet_DAC extends JFrame {
         feuVoie1Panel.add(feuVoie1Orange);
         feuVoie1Green.setBounds(0, 70, 30, 35);
         feuVoie1Green.setIcon(new javax.swing.ImageIcon("lights/2*.jpg"));
-        feuVoie1Green.setEnabled(false);
+        // [CONCURRENCY FIX - P2: initial light state matches monitor]
+        // carrefourManager.feuVert1 starts as TRUE, so the visual light
+        // for voie1 must start GREEN to match. The original code had
+        // ALL labels disabled, which made the first cycle look like
+        // cars were running a red light even though the monitor's
+        // logical state correctly admitted them.
+        feuVoie1Green.setEnabled(true);
         feuVoie1Panel.add(feuVoie1Green);
         
         feuVoie1Panel.setBounds(630, 180, 30, 105);
@@ -178,12 +211,21 @@ public class MiniProjet_DAC extends JFrame {
         speedSlider.setSnapToTicks(true);
         speedSlider.setOpaque(true);
         speedSlider.addChangeListener(new ChangeListener() {
+            // [Concurrency Tech: EDT -> producer handshake via Atomic + CountDownLatch]
+            // Runs on the EDT.
+            // [CONCURRENCY FIX - P2: ordering of latch publish vs flag]
+            // Allocate the new latch FIRST, then set settingChanged=true.
+            // The volatile-write of settingChanged then serves as the
+            // release fence; any thread that observes settingChanged==
+            // true is guaranteed (by JMM) to also see the new latch
+            // reference. The previous order (set flag, then assign
+            // latch) gave no such guarantee.
             public void stateChanged(ChangeEvent event) {
-                if (!settingChanged.get()) { //testing if this is the first setting changed before been applied
-                    settingChanged.set(true); //setting changed waiting to be applied 
-                    carCounterInTheStreet = new CountDownLatch(carNumberInTheStreet.get()); //initialisation of the countdownlatch with the number of cars in the street to wait for theme before applying setting changes
+                if (!settingChanged.get()) {
+                    carCounterInTheStreet = new CountDownLatch(carNumberInTheStreet.get());
+                    settingChanged.set(true);
                 }
-                speed = 8 - speedSlider.getValue() + 1; //reseting the new spped of the cars
+                speed = 8 - speedSlider.getValue() + 1;
             }
         });
         speedSlider.setBounds(10, 260, 380, 50);
@@ -225,13 +267,31 @@ public class MiniProjet_DAC extends JFrame {
         lightDurationSlider.setSnapToTicks(true);
         lightDurationSlider.setOpaque(true);
         lightDurationSlider.addChangeListener(new ChangeListener() {
+            // [CONCURRENCY FIX - slider-induced producer deadlock]
+            // The previous version set mainStopedTheTimer=true which
+            // parked lightManager on mainRestartTimer.await(). The only
+            // place that signals mainRestartTimer is creationNewCars()
+            // (the START button handler), so a slider drag with no
+            // STOP/START would freeze the light controller, hang the
+            // queue at PHASE B, prevent cars from exiting traversee,
+            // and the producer would await the CountDownLatch forever
+            // -- no new cars would ever spawn.
+            //
+            // The fix is to NOT use the handshake at all. lightManager's
+            // chunked sleep re-reads duree_de_feu every 100ms (and
+            // re-evaluates it at the top of every Intersection() cycle),
+            // so a new value naturally takes effect within one cycle.
+            // We still use the latch to delay applying the new setting
+            // to fresh cars, but the light cycle is independent now.
             public void stateChanged(ChangeEvent event) {
-                if (!settingChanged.get()) {//testing if this is the first setting changed before been applied
-                    settingChanged.set(true);//setting changed waiting to be applied
-                    carCounterInTheStreet = new CountDownLatch(carNumberInTheStreet.get());//initialisation of the countdownlatch with the number of cars in the street to wait for theme before applying setting changes
+                if (!settingChanged.get()) {
+                    carCounterInTheStreet = new CountDownLatch(carNumberInTheStreet.get());
+                    settingChanged.set(true);
                 }
-                duree_de_feu.set(lightDurationSlider.getValue() * 1000);//resetting the new light duration
-                mainStopedTheTimer.set(true); //resetting this boolean to true which indicate the change of light duration to stop the timer by the carrefour manager
+                duree_de_feu.set(lightDurationSlider.getValue() * 1000);
+                // mainStopedTheTimer is no longer set here -- the chunked
+                // lightManager sleep + re-read picks up duree_de_feu
+                // changes on its own.
             }
         });
         lightDurationSlider.setBounds(10, 510, 380, 50);
@@ -269,10 +329,16 @@ public class MiniProjet_DAC extends JFrame {
         stopButton.setFont(new java.awt.Font("Chalkboard SE", 0, 18)); // NOI18N
         stopButton.setText("STOP");
         stopButton.addActionListener(new ActionListener() {
+            // [Concurrency Tech: AtomicBoolean as the STOP gate flag]
+            // Runs on the EDT. Worker threads (cars, lightManager, the
+            // producer) check stopButtonIsActive at every safe point and
+            // call pauseIfStopped(), which acquires the `restart`
+            // Semaphore. Setting this AtomicBoolean here is the
+            // single-writer source of truth for "we are paused".
             public void actionPerformed(ActionEvent arg0) {
                 startButton.setEnabled(true);
                 stopButton.setEnabled(false);
-                stopButtonIsActive.set(true); //resseting the boolean that indicate the stop of the cars
+                stopButtonIsActive.set(true);
             }
         });
         stopButton.setBounds(210, 740, 130, 50);
@@ -303,109 +369,260 @@ public class MiniProjet_DAC extends JFrame {
          //</editor-fold>
     }
     
+    // [Concurrency Tech: EDT synchronization with invokeAndWait]
+    // WHY: the producer thread is about to launch a car worker thread that
+    // will immediately read/write the panel (e.g. C.getBounds(), setBounds).
+    // The panel must be fully constructed AND attached to crossroadPanel
+    // BEFORE the worker starts, otherwise the worker can race on a panel
+    // that is not yet a child of any container (NullPointerException on
+    // repaint, or invisible cars). invokeAndWait blocks the producer
+    // thread until the EDT has finished the install, giving us a clean
+    // happens-before edge between "panel is mounted" and "worker starts".
+    static void runOnEventDispatchThreadAndWait(Runnable r) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            r.run();
+        } else {
+            try {
+                SwingUtilities.invokeAndWait(r);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            } catch (InvocationTargetException ex) {
+                Logger.getLogger(MiniProjet_DAC.class.getName()).log(Level.SEVERE, null, ex);
+            }
+        }
+    }
+
+    // [Concurrency Tech: EDT-safe panel install for voie 1]
+    // Image I/O is left off the EDT (constructor only reads a PNG); only
+    // the Swing-touching steps (setOpaque, setBounds, add) are dispatched
+    // to the EDT so the EDT stays responsive.
+    private imgVoitureVoie1 createVoie1CarPanel() {
+        final imgVoitureVoie1 c = new imgVoitureVoie1();
+        runOnEventDispatchThreadAndWait(() -> {
+            c.setOpaque(true);
+            c.setBounds(0, -60, 30, 60);
+            crossroadPanel.add(c);
+        });
+        return c;
+    }
+
+    // [Concurrency Tech: EDT-safe panel install for voie 2]
+    private imgVoitureVoie2 createVoie2CarPanel() {
+        final imgVoitureVoie2 c = new imgVoitureVoie2();
+        runOnEventDispatchThreadAndWait(() -> {
+            c.setOpaque(true);
+            c.setBounds(-60, 0, 60, 30);
+            crossroadPanel.add(c);
+        });
+        return c;
+    }
+
     public void creationNewCars(ActionEvent e){
-        
+
         startButton.setEnabled(false);
         stopButton.setEnabled(true);
 
-        // implementation with locks not the best because 
-        //there is no guarantee to wake theme with FIFO 
-        //it depends on JVM which could make some problem in high speed and big traffic
-        /*
-        verro2.lock();
-        try{
-            restart.signalAll();
-        }finally{
-            verro2.unlock();
-        }*/
-        //implementation with semaphore solves this problem to us
-        if (stopButtonIsActive.get()) {
+        // [CONCURRENCY FIX - P1#6: Semaphore permit hygiene]
+        // WHY drain BEFORE release: the previous code only released
+        // permits on START and never drained on STOP. Across multiple
+        // STOP/START cycles, leaked permits accumulated and let some
+        // threads sail through pauseIfStopped() without actually
+        // pausing. drainPermits() is idempotent and zeros the gate.
+        restart.drainPermits();
 
-            restart.release(carNumberInTheStreet.get() + 2);
+        // [CONCURRENCY FIX - ADV-GHOST-LANE-02: NEVER rebuild carrefour]
+        // Rebuilding the carrefourManager would orphan all live car
+        // threads: their `gestionnaire` field still references the old
+        // instance, so they would register into the OLD voie*LaneCars
+        // lists, while new cars register into the NEW lists. PHASE A
+        // scans only its own carrefour's lists -- old and new cars
+        // would be mutually invisible, defeating spacing entirely on
+        // shared lanes.
+        // The carrefourManager is a long-lived singleton for the
+        // application session. Only the lightManager thread is
+        // recreated when it dies (which should never happen now that
+        // its catch-block does not re-set the interrupt flag, but the
+        // isAlive() check is defensive).
+        if (carrefour == null) {
+            carrefour = new carrefourManager();
         }
+        if (changeFeu == null || !changeFeu.isAlive()) {
+            // [Concurrency Tech: dedicated lightManager Thread]
+            changeFeu = new lightManager(carrefour);
+            changeFeu.start();
+        }
+
+        // [Concurrency Tech: AtomicBoolean publishes "we are running again"]
+        // Order: clear the flags FIRST, THEN release permits. A thread
+        // unblocked from restart.acquire() will re-check
+        // stopButtonIsActive in pauseIfStopped() -- if we released
+        // first, it could see stopButtonIsActive==true and immediately
+        // re-acquire (deadlock until next STOP/START).
         stopButtonIsActive.set(false);
         mainStopedTheTimer.set(false);
 
-        if (carrefour == null) {
-            carrefour = new carrefourManager();
+        // [CONCURRENCY FIX - P1#6: precise permit release]
+        // Release exactly one permit per actually-parked worker:
+        //   - one per car thread (carNumberInTheStreet),
+        //   - +1 for lightManager IF it is alive,
+        //   - +1 for the producer IF it is alive.
+        // The original "+ 2" assumed lightManager and producer were
+        // always parked, which is not true on first START or after a
+        // worker died.
+        int parked = carNumberInTheStreet.get();
+        int extras = (changeFeu != null && changeFeu.isAlive() ? 1 : 0)
+                   + (createCars != null && createCars.isAlive() ? 1 : 0);
+        restart.release(parked + extras);
 
-            changeFeu = new lightManager(carrefour);
-            changeFeu.start();
+        // [CONCURRENCY FIX - P1#9: producer-thread mainRestartTimer signal race]
+        // The original creationNewCars set mainStopedTheTimer.set(false)
+        // on the EDT, then the producer thread separately checked the
+        // SAME flag at the top of its slider-applied block. If the EDT
+        // cleared the flag first, the producer skipped the
+        // mainRestartTimer.signal() block, leaving the lightManager
+        // permanently parked on mainRestartTimer.await(). The fix is
+        // to ALWAYS signal mainRestartTimer here (under verro), so the
+        // lightManager wakes regardless of who won the EDT-vs-producer
+        // race. Signal is idempotent: if the lightManager was not in
+        // fact waiting, the signal is harmlessly lost.
+        verro.lock();
+        try {
+            mainRestartTimer.signalAll();
+        } finally {
+            verro.unlock();
+        }
 
-            createCars = new Thread(new Runnable() { //the work of the thread that creats cars
+        if (createCars == null || !createCars.isAlive()) {
+
+            // [Concurrency Tech: producer thread spawning car threads]
+            // WHY a separate thread (not the EDT): this loop has to
+            // sleep(circulationGrow) and await on the CountDownLatch
+            // when settings change. Either of those would freeze the UI
+            // if run on the EDT. The producer ONLY touches Swing through
+            // createVoie*CarPanel, which dispatches to the EDT.
+            createCars = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    int voie1Position;
-                    int voie2Position;
+                    while (true) {
+                        // [Concurrency Tech: Semaphore acquire as STOP gate]
+                        // Centralised via carrefour.pauseIfStopped() so
+                        // every worker (cars, lightManager, producer)
+                        // uses the same gate logic.
+                        carrefour.pauseIfStopped();
 
-                    while (/*!stopButtonIsActive.get()*/true) {  //this comment was when we used locks
+                        // [CONCURRENCY FIX - P2: chunked sleep for STOP responsiveness]
+                        // Splitting circulationGrow (up to 8s) into 100ms
+                        // chunks lets STOP take effect within ~100ms
+                        // instead of up to 8s.
                         try {
-                            if (stopButtonIsActive.get()) {
-                                restart.acquire();
-                                sleep(500); //this small sleep is for some security reason
+                            int remaining = circulationGrow;
+                            while (remaining > 0 && !stopButtonIsActive.get()) {
+                                int chunk = Math.min(100, remaining);
+                                sleep(chunk);
+                                remaining -= chunk;
                             }
                         } catch (InterruptedException ex) {
-                            System.out.println(ex.getMessage());
+                            Thread.currentThread().interrupt();
+                            continue;
                         }
+                        // [CONCURRENCY FIX - ADV-PROD-HANG-01]
+                        // If STOP fired during the chunked sleep, do NOT
+                        // fall through to the latch await. Loop back to
+                        // pauseIfStopped() so the producer joins the
+                        // semaphore queue properly.
+                        if (stopButtonIsActive.get()) continue;
 
                         try {
-                            sleep(circulationGrow);
-                            if (settingChanged.get()) { //if settings changes stop creating new cars until the settings been applied
-                                carCounterInTheStreet.await();
-                                settingChanged.set(false);
-                                if (mainStopedTheTimer.get()) {
-                                     verro.lock();
-                                    try{
-                                        mainStopedTheTimer.set(false);
-                                        mainRestartTimer.signal();
-                                    }finally{
-                                        verro.unlock();
+                            if (settingChanged.get()) {
+                                // [Concurrency Tech: CountDownLatch BOUNDED handoff]
+                                // [CONCURRENCY FIX - simplified]
+                                // The latch's purpose is purely cosmetic:
+                                // it waits for the old generation of
+                                // cars to drain off-screen before
+                                // spawning the new generation with new
+                                // settings. But correctness does NOT
+                                // depend on it: each car captures its
+                                // vitess as a final field at
+                                // construction, so a slider change does
+                                // not affect cars already on the road,
+                                // and PHASE A's dynamic spacing keeps
+                                // any mix of vitesses safely separated.
+                                //
+                                // Previously this was an unbounded
+                                // await -- if any car was unable to
+                                // exit (PHASE B stuck on a slow light
+                                // cycle, STOP fired mid-await, etc.)
+                                // the producer hung forever and no new
+                                // cars ever appeared.
+                                //
+                                // We now wait at most 3 seconds for the
+                                // latch to drain, then apply the new
+                                // settings unconditionally and spawn.
+                                // The old generation continues at its
+                                // original speed; the new generation
+                                // starts at the new speed; PHASE A
+                                // mediates the lane spacing.
+                                CountDownLatch latch = carCounterInTheStreet;
+                                if (latch != null) {
+                                    long deadline = System.currentTimeMillis() + 3000;
+                                    while (latch.getCount() > 0
+                                            && !stopButtonIsActive.get()
+                                            && System.currentTimeMillis() < deadline) {
+                                        if (latch.await(200, TimeUnit.MILLISECONDS)) break;
                                     }
-                                    
+                                }
+                                if (!stopButtonIsActive.get()) {
+                                    settingChanged.set(false);
                                 }
                             }
                         } catch (InterruptedException ex) {
-                            Logger.getLogger(carrefourManager.class.getName()).log(Level.SEVERE, null, ex);
+                            Thread.currentThread().interrupt();
+                            continue;
                         }
+                        // Same: if STOP fired during the latch wait, go
+                        // back to the gate instead of spawning cars.
+                        if (stopButtonIsActive.get()) continue;
 
+                        // [CONCURRENCY FIX - P1#7 + ADV-LATCH-02: per-pair gate check]
+                        // Break the burst on STOP *or* on a mid-burst slider
+                        // change. Without the settingChanged check, a slider
+                        // drag during the for-loop produced mixed-vitess cars
+                        // in the same wave -- new fast cars and old slow cars
+                        // could end up on the same lane simultaneously, which
+                        // PHASE A throttles correctly but visually causes
+                        // jitter. Breaking out lets the outer-loop's latch
+                        // handshake drain old cars before next-wave spawn
+                        // applies the new setting cleanly.
                         for (int i = 0; i < carsPerWave; i++) {
-                            voie1Position = (new Random().nextInt(4)) + 1;//taking random position for the car in voie1
-                            voie2Position = (new Random().nextInt(4)) + 1;//taking random position for the car in voie2
+                            if (stopButtonIsActive.get() || settingChanged.get()) break;
 
-                            voitureV1_V2 voitureVoie1;
-                            voitureV2_V1 voitureVoie2;
-                            C1 = new imgVoitureVoie1();
-                            C1.setOpaque(true);
-                            C1.setBounds(0, -60, 30, 60);
-                            crossroadPanel.add(C1);
-                            C2 = new imgVoitureVoie2();
-                            C2.setOpaque(true);
-                            crossroadPanel.add(C2);
-                            C2.setBounds(-60, 0, 60, 30);
-                            voitureVoie1 = new voitureV1_V2(carrefour, C1, voie1Position, voie1Position * speed);//creating the car thread 
-                            voitureVoie2 = new voitureV2_V1(carrefour, C2, voie2Position, voie2Position * speed);//creating the car thread
+                            int voie1Position = (new Random().nextInt(4)) + 1;
+                            int voie2Position = (new Random().nextInt(4)) + 1;
+
+                            // [CONCURRENCY FIX - EDT: panel install before worker start]
+                            // createVoie*CarPanel performs the Swing
+                            // mutations (setOpaque/setBounds/add) on the
+                            // EDT via invokeAndWait so the panel is
+                            // mounted before the worker thread starts.
+                            imgVoitureVoie1 c1 = createVoie1CarPanel();
+                            imgVoitureVoie2 c2 = createVoie2CarPanel();
+                            voitureV1_V2 voitureVoie1 = new voitureV1_V2(carrefour, c1, voie1Position, voie1Position * speed);
+                            voitureV2_V1 voitureVoie2 = new voitureV2_V1(carrefour, c2, voie2Position, voie2Position * speed);
                             voitureVoie1.start();
                             voitureVoie2.start();
 
                             try {
                                 sleep(250);
                             } catch (InterruptedException ex) {
-                                Logger.getLogger(carrefourManager.class.getName()).log(Level.SEVERE, null, ex);
+                                Thread.currentThread().interrupt();
+                                break;
                             }
                         }
                     }
-                    /* //this was when we used locks
-                    mytimer.stop();
-                    mainStopedTheTimer.set(true);
-                    seconds.set(duree_de_feu.get() / 1000);
-                    lightTimer.setText(String.valueOf(seconds.get()));
-                    */
-
                 }
             });
             createCars.start();
         }
-        //mytimer.start(); //this was when we used locks
     }
 
     public static void main(String[] args) {
