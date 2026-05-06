@@ -1,8 +1,10 @@
 
 package mini.projet_dac;
 
+import java.awt.Container;
 import java.util.concurrent.CountDownLatch;
 import javax.swing.JPanel;
+import javax.swing.SwingUtilities;
 import static mini.projet_dac.MiniProjet_DAC.carCounterInTheStreet;
 import static mini.projet_dac.MiniProjet_DAC.carNumberInTheStreet;
 
@@ -44,13 +46,20 @@ public class voitureV2_V1 extends Thread{
         } finally {
             carNumberInTheStreet.decrementAndGet();
 
+            // [CONCURRENCY FIX - ADV-SPAWN-01 + panel cleanup]
+            // Symmetric to voitureV1_V2: enqueue remove BEFORE the
+            // latch countDown so EDT processes [remove old] before
+            // [add new] from the woken producer.
+            SwingUtilities.invokeLater(() -> {
+                Container parent = car.getParent();
+                if (parent != null) {
+                    java.awt.Rectangle bounds = car.getBounds();
+                    parent.remove(car);
+                    parent.repaint(bounds.x, bounds.y, bounds.width, bounds.height);
+                }
+            });
+
             // [Concurrency Tech: CountDownLatch handshake with settings change]
-            // Counting down lets the producer thread know one more "old"
-            // car has cleared the street, so a pending speed /
-            // light-duration change can be applied once the generation
-            // has fully drained. Snapshot the field to avoid a TOCTOU
-            // NPE if the EDT reassigns it between the null check and
-            // countDown().
             CountDownLatch latch = carCounterInTheStreet;
             if (latch != null)
                 latch.countDown();

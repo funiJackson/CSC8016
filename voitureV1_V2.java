@@ -1,8 +1,10 @@
 
 package mini.projet_dac;
 
+import java.awt.Container;
 import java.util.concurrent.CountDownLatch;
 import javax.swing.JPanel;
+import javax.swing.SwingUtilities;
 import static mini.projet_dac.MiniProjet_DAC.carCounterInTheStreet;
 import static mini.projet_dac.MiniProjet_DAC.carNumberInTheStreet;
 
@@ -52,15 +54,27 @@ public class voitureV1_V2 extends Thread {
         } finally {
             carNumberInTheStreet.decrementAndGet();
 
+            // [CONCURRENCY FIX - ADV-SPAWN-01: queue remove BEFORE waking producer]
+            // Order matters: enqueue the panel removal on the EDT
+            // FIRST, then countDown the latch. If we counted down
+            // first, the producer (which polls the latch every 200ms)
+            // could wake, race into createVoie*CarPanel, and call
+            // invokeAndWait(add) -- arriving on the EDT EventQueue
+            // BEFORE this thread's invokeLater(remove). The EDT would
+            // then process [add new] before [remove old], transiently
+            // inflating crossroadPanel's child count. Doing the
+            // invokeLater first guarantees FIFO order: [remove old,
+            // ..., add new].
+            SwingUtilities.invokeLater(() -> {
+                Container parent = car.getParent();
+                if (parent != null) {
+                    java.awt.Rectangle bounds = car.getBounds();
+                    parent.remove(car);
+                    parent.repaint(bounds.x, bounds.y, bounds.width, bounds.height);
+                }
+            });
+
             // [Concurrency Tech: CountDownLatch handshake with settings change]
-            // When the user moves the speed/light-duration sliders, the
-            // producer thread allocates a CountDownLatch sized to the cars
-            // currently on the street and then awaits it. Each car that was
-            // already on the street counts down on exit, so the new setting
-            // is applied only after this generation has cleared the road.
-            // The null-check covers cars created before any slider change.
-            // Read the field once to avoid a TOCTOU NPE if the EDT reassigns
-            // it between the null-check and the countDown call.
             CountDownLatch latch = carCounterInTheStreet;
             if (latch != null)
                 latch.countDown();

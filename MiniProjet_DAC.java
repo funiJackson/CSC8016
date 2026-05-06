@@ -504,6 +504,26 @@ public class MiniProjet_DAC extends JFrame {
                 @Override
                 public void run() {
                     while (true) {
+                        // [CONCURRENCY FIX - ADV-SPAWN-02: drain stale interrupt flag]
+                        // WHY: runOnEventDispatchThreadAndWait catches
+                        // InterruptedException from invokeAndWait and
+                        // re-sets the interrupt flag (preserving caller's
+                        // interrupt status -- standard pattern). If a
+                        // spurious interrupt arrives (GC pause, OS
+                        // signal, JVM internals) during a producer's
+                        // createVoie*CarPanel call, the flag returns to
+                        // the producer set. Then sleep(250) inside the
+                        // inner for-loop throws InterruptedException
+                        // immediately, catch re-sets flag, continue --
+                        // outer while restarts: chunked sleep ALSO
+                        // throws immediately, infinite-spin at 100% CPU
+                        // and zero new cars spawned forever.
+                        // Thread.interrupted() returns AND clears the
+                        // flag, breaking the spin. Once-per-iteration
+                        // drain is enough -- the flag will never be
+                        // set unless something interrupted us.
+                        Thread.interrupted();
+
                         // [Concurrency Tech: Semaphore acquire as STOP gate]
                         // Centralised via carrefour.pauseIfStopped() so
                         // every worker (cars, lightManager, producer)

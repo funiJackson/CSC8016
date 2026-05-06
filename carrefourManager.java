@@ -360,13 +360,27 @@ public class carrefourManager {
         // Followers iterate the lane registry under verro and read this
         // value lock-free; the render timer (60fps EDT timer) reads it
         // lock-free to update the visible panel bounds.
+        // [CONCURRENCY FIX - ADV-PHASE-A-INITIAL-DEADLOCK]
+        // Initialize to Integer.MIN_VALUE rather than -60 so peers
+        // looking at us BEFORE we've passed our first PHASE A gate
+        // (i.e. before myJ.set(j) is called) see a sentinel value
+        // that never satisfies the spacing predicate `oj >= myJ`.
+        // Otherwise two cars spawned in rapid succession on the same
+        // lane both register with myJ=-60, both enter PHASE A's
+        // hasCloseCar scan, both find a peer at -60 with distance 0
+        // <= slotSpacing, and BOTH AWAIT carSpacingChanged forever --
+        // a mutual deadlock that leaks carNumberInTheStreet count and
+        // ultimately stalls spawning entirely.
         java.util.concurrent.atomic.AtomicInteger myJ =
-                new java.util.concurrent.atomic.AtomicInteger(-60);
+                new java.util.concurrent.atomic.AtomicInteger(Integer.MIN_VALUE);
 
         // [CONCURRENCY FIX - ADV-EDT-01: register with render timer]
         // The render timer (16ms tick on EDT) reads myJ every frame and
         // moves this panel to the correct position. NO per-pixel
         // invokeLater is needed -- this is the entire visual pipeline.
+        // Note: until myJ.set(-60) runs in the first PHASE A pass,
+        // the timer paints the panel at y=Integer.MIN_VALUE, which is
+        // off-screen and harmless.
         RenderEntry renderEntry = new RenderEntry(C, myJ, laneX, true);
         renderRegistry.add(renderEntry);
 
@@ -449,8 +463,27 @@ public class carrefourManager {
                 voie1LaneCars[p - 1].remove(myJ);
                 if (enteredIntersection) {
                     nmbrVoitureIntersection--;
-                    if (nmbrVoitureIntersection == 0 && !feuVert1) {
+                    // [CONCURRENCY FIX - ADV-LIVENESS-01]
+                    // Signal BOTH intersection-cleared Conditions when
+                    // count hits 0, ignoring whose light is green.
+                    // The old code signaled only voie1_Cars_In_Intersection
+                    // guarded by `!feuVert1`, assuming "the last car to
+                    // exit belongs to the voie whose green is being
+                    // switched off." That fails for slow voie1 cars
+                    // whose traversal spans 2+ light cycles: by the time
+                    // the slow car exits, lightManager may already be
+                    // awaiting voie2_Cars_In_Intersection. Signaling
+                    // only voie1's condition leaves lightManager parked
+                    // forever -> light cycle freezes -> all PHASE-B
+                    // cars never wake -> finally never runs -> render
+                    // registry leaks unboundedly -> EDT saturates ->
+                    // producer's invokeAndWait stalls -> spawn stops.
+                    // signalAll on an empty wait queue is a no-op, and
+                    // both Intersection() awaits are inside while-loops
+                    // so spurious wakeups are handled.
+                    if (nmbrVoitureIntersection == 0) {
                         voie1_Cars_In_Intersection.signalAll();
+                        voie2_Cars_In_Intersection.signalAll();
                     }
                 }
                 carSpacingChangedVoie1[p - 1].signalAll();
@@ -492,8 +525,12 @@ public class carrefourManager {
         final int laneY = voie2PositionPossible[p - 1];
         boolean enteredIntersection = false;
 
+        // [CONCURRENCY FIX - ADV-PHASE-A-INITIAL-DEADLOCK]
+        // See traversee1 for the full rationale: Integer.MIN_VALUE
+        // sentinel prevents two newly-spawned same-lane cars from
+        // mutually deadlocking before either has passed PHASE A.
         java.util.concurrent.atomic.AtomicInteger myJ =
-                new java.util.concurrent.atomic.AtomicInteger(-60);
+                new java.util.concurrent.atomic.AtomicInteger(Integer.MIN_VALUE);
 
         // [CONCURRENCY FIX - ADV-EDT-01: register with render timer]
         RenderEntry renderEntry = new RenderEntry(C, myJ, laneY, false);
@@ -559,7 +596,12 @@ public class carrefourManager {
                 voie2LaneCars[p - 1].remove(myJ);
                 if (enteredIntersection) {
                     nmbrVoitureIntersection--;
-                    if (nmbrVoitureIntersection == 0 && !feuVert2) {
+                    // [CONCURRENCY FIX - ADV-LIVENESS-01]
+                    // Symmetric to traversee1: signal BOTH Conditions
+                    // when count hits 0. See traversee1 finally for
+                    // the full rationale.
+                    if (nmbrVoitureIntersection == 0) {
+                        voie1_Cars_In_Intersection.signalAll();
                         voie2_Cars_In_Intersection.signalAll();
                     }
                 }
